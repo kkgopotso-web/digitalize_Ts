@@ -1,0 +1,6 @@
+streamlit>=1.38
+supabase>=2.8
+python-dotenv>=1.0
+pydantic>=2.7
+email-validator>=2.1
+pytest>=8.0

@@ -3,7 +3,10 @@ import hmac
 import hashlib
 import logging
 from decimal import Decimal
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field, EmailStr, field_validator
+
+load_dotenv()
 
 logger = logging.getLogger("ProfessionalOS.Compliance")
 
@@ -19,6 +22,13 @@ class SecureTransactionPayload(BaseModel):
         if v <= 0:
             raise ValueError("Transaction financial metrics must be strictly greater than zero.")
         return v
+
+def get_system_salt() -> str:
+    """Retrieves and validates the POPIA salt key from environment variables."""
+    salt = os.getenv("POPIA_SALT_KEY")
+    if not salt or len(salt) < 16:
+        raise ValueError("System security failure: Insecure or missing POPIA_SALT_KEY in environment.")
+    return salt
 
 def generate_popia_hash(sensitive_value: str, salt_secret: str) -> str:
     """Generates a cryptographically secure, irreversible SHA-256 HMAC hash."""
@@ -38,7 +48,6 @@ def process_and_mask_transaction(payload_data: dict, salt_key: str) -> dict:
     masked_phone = generate_popia_hash(validated_data.raw_phone_number, salt_key)
     masked_email = generate_popia_hash(validated_data.raw_email, salt_key)
     
-    # Enforce Decimal precision for ZAR conversion
     zar_value = Decimal(validated_data.gross_value_cents) / Decimal(100)
     
     logger.info("Transaction successfully masked under POPIA compliance protocols.")
