@@ -9,12 +9,33 @@ from supabase import create_client
 from popia_pipeline import process_and_mask_transaction, get_system_salt
 from bi_dispatch import compute_merchant_metrics, dispatch_bi_summary
 from csv_ingestion import ingest_transactions_csv, CsvFormatError
+from tenant_auth import Tenant, TenantAuthError, get_tenant_token_pepper, resolve_tenant
 
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+
+
+def _lookup_tenant_by_hash(token_hash: str):
+    """Looks up a tenant by its token hash. Returns None on any failure
+    (no Supabase configured, unknown hash, or a query error)."""
+    if supabase is None:
+        return None
+    try:
+        resp = supabase.table("tenants").select("id,is_active").eq("token_hash", token_hash).limit(1).execute()
+        rows = resp.data or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+def resolve_current_tenant(raw_token: str) -> Tenant:
+    """Resolves the tenant token entered in the sidebar. Raises
+    TenantAuthError (generic message) or ValueError (pepper misconfigured)."""
+    pepper = get_tenant_token_pepper()
+    return resolve_tenant(raw_token, pepper, _lookup_tenant_by_hash)
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
@@ -30,11 +51,34 @@ if "ai_summaries" not in st.session_state:
     st.session_state.ai_summaries = {}
 if "bulk_summary" not in st.session_state:
     st.session_state.bulk_summary = None
+if "tenant" not in st.session_state:
+    st.session_state.tenant = None
 
 # ---------- Sidebar: system status ----------
 with st.sidebar:
     st.markdown("### Orynexa Technologies")
     st.caption("ProfessionalOS — POC 1")
+
+    st.markdown("**Tenant**")
+    tenant_token_input = st.text_input(
+        "Tenant API token", type="password", key="tenant_token_input",
+        help="Issued when your business was onboarded (scripts/create_tenant.py).",
+    )
+    if tenant_token_input:
+        try:
+            st.session_state.tenant = resolve_current_tenant(tenant_token_input)
+            st.success(f"Tenant resolved: {st.session_state.tenant.id[:8]}…")
+        except TenantAuthError:
+            st.session_state.tenant = None
+            st.error("Invalid or unknown tenant token.")
+        except ValueError:
+            st.session_state.tenant = None
+            st.error("Tenant auth not configured (TENANT_TOKEN_PEPPER missing).")
+    else:
+        st.session_state.tenant = None
+        st.info("Enter a tenant token to process transactions.")
+
+    st.divider()
 
     try:
         get_system_salt()
@@ -89,6 +133,10 @@ with form_col:
 
     if submitted:
         try:
+            tenant = st.session_state.get("tenant")
+            if tenant is None:
+                raise ValueError("A valid tenant token is required (see sidebar) before processing transactions.")
+
             salt = get_system_salt()
             raw_payload = {
                 "merchant_id": merchant_id,
@@ -99,6 +147,7 @@ with form_col:
 
             with st.spinner("Validating and anonymising payload..."):
                 sanitized = process_and_mask_transaction(raw_payload, salt)
+                sanitized["tenant_id"] = tenant.id
 
                 if supabase:
                     supabase.table("anonymized_transactions").insert(sanitized).execute()
@@ -164,6 +213,10 @@ uploaded_file = st.file_uploader("Choose a CSV file", type=["csv"], key="bulk_cs
 
 if uploaded_file is not None and st.button("Process CSV", type="primary"):
     try:
+        tenant = st.session_state.get("tenant")
+        if tenant is None:
+            raise ValueError("A valid tenant token is required (see sidebar) before processing transactions.")
+
         salt = get_system_salt()
         csv_text = uploaded_file.getvalue().decode("utf-8")
 
@@ -175,6 +228,7 @@ if uploaded_file is not None and st.button("Process CSV", type="primary"):
                 if row.status != "success":
                     continue
                 sanitized = row.model_dump(exclude={"row_number", "status", "error"})
+                sanitized["tenant_id"] = tenant.id
                 if supabase:
                     try:
                         supabase.table("anonymized_transactions").insert(sanitized).execute()

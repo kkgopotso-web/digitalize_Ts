@@ -4,12 +4,16 @@ Lets external POS / e-commerce frontends submit raw transaction payloads
 directly, over a production-style HTTP API, instead of the Streamlit form.
 Every request goes through the exact same deterministic validation and
 masking core as app.py (popia_pipeline.py) -- this file only adds the
-HTTP/auth/production concerns on top:
+HTTP/auth/production/multi-tenant concerns on top:
 
-- Bearer-token auth, fail-closed if the token isn't configured (a POPIA
-  webhook accepting unauthenticated writes is a worse failure mode than
-  briefly refusing traffic).
-- A body-size guard, since the payload is always a handful of short fields.
+- Per-tenant bearer-token auth (tenant_auth.py): every request is resolved
+  to a specific onboarded tenant, and every persisted row is tagged with
+  that tenant's id. Fail-closed if tenant auth isn't configured (Supabase
+  + TENANT_TOKEN_PEPPER) -- a webhook accepting unauthenticated or
+  unattributed writes is a worse failure mode than briefly refusing
+  traffic.
+- A body-size guard, since a single-transaction payload is always a
+  handful of short fields (CSV bulk uploads get a separate, larger cap).
 - Persistence to Supabase is best-effort: a masking/validation success is
   still returned to the caller even if the database write fails, with
   `persisted: false` so the caller can decide how to react. This mirrors
@@ -27,6 +31,7 @@ from supabase import create_client
 
 from popia_pipeline import SecureTransactionPayload, process_and_mask_transaction, get_system_salt
 from csv_ingestion import CsvFormatError, ingest_transactions_csv
+from tenant_auth import Tenant, TenantAuthError, get_tenant_token_pepper, resolve_tenant
 
 load_dotenv()
 
@@ -43,7 +48,7 @@ MAX_CSV_BODY_BYTES = 1_000_000
 app = FastAPI(
     title="ProfessionalOS Secure Transaction Gateway API",
     version="1.0.0",
-    description="POPIA-compliant webhook for POS / e-commerce transaction intake.",
+    description="POPIA-compliant, multi-tenant webhook for POS / e-commerce transaction intake.",
 )
 
 
@@ -53,6 +58,7 @@ class SanitizedTransactionResponse(BaseModel):
     masked_contact_phone: str
     masked_contact_email: str
     compliance_status: str
+    tenant_id: str
     persisted: bool
 
 
@@ -69,6 +75,7 @@ class BulkIngestionRowResponse(BaseModel):
 
 
 class BulkIngestionResponse(BaseModel):
+    tenant_id: str
     total_rows: int
     succeeded: int
     failed: int
@@ -80,6 +87,7 @@ class HealthResponse(BaseModel):
     status: str
     salt_configured: bool
     supabase_configured: bool
+    tenant_auth_configured: bool
 
 
 def _get_supabase_client():
@@ -88,6 +96,28 @@ def _get_supabase_client():
     if url and key:
         return create_client(url, key)
     return None
+
+
+def _lookup_tenant_by_hash(token_hash: str) -> Optional[dict]:
+    """Looks up a tenant by its token hash. Returns None on any failure
+    (unknown hash, no Supabase configured, or a query error) -- resolve_tenant
+    turns every "no record" case into the same generic auth error."""
+    client = _get_supabase_client()
+    if client is None:
+        return None
+    try:
+        resp = (
+            client.table("tenants")
+            .select("id,is_active")
+            .eq("token_hash", token_hash)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        return rows[0] if rows else None
+    except Exception as exc:  # noqa: BLE001 -- treat any lookup failure as "unknown token"
+        logger.warning("Tenant lookup failed: %s", exc)
+        return None
 
 
 @app.middleware("http")
@@ -100,16 +130,27 @@ async def enforce_max_body_size(request: Request, call_next):
     return await call_next(request)
 
 
-def require_api_token(authorization: Optional[str] = Header(default=None)) -> None:
-    """Fail closed: no configured token means no authenticated access at all."""
-    expected = os.getenv("API_WEBHOOK_TOKEN", "")
-    if not expected:
-        raise HTTPException(status_code=503, detail="API authentication is not configured on this server.")
+def require_tenant(authorization: Optional[str] = Header(default=None)) -> Tenant:
+    """Fail closed: no configured tenant auth (Supabase + pepper) means no
+    authenticated access at all. Resolves the bearer token to a specific
+    active tenant, or raises a 401 with a single generic message -- never
+    revealing whether the token was malformed, unknown, or deactivated."""
+    if not os.getenv("SUPABASE_URL") or not os.getenv("SUPABASE_KEY"):
+        raise HTTPException(status_code=503, detail="Tenant authentication is not configured on this server.")
+
+    try:
+        pepper = get_tenant_token_pepper()
+    except ValueError:
+        raise HTTPException(status_code=503, detail="Tenant authentication is not configured on this server.")
+
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token.")
-    provided = authorization[len("Bearer "):].strip()
-    if provided != expected:
-        raise HTTPException(status_code=401, detail="Invalid API token.")
+    token = authorization[len("Bearer "):].strip()
+
+    try:
+        return resolve_tenant(token, pepper, _lookup_tenant_by_hash)
+    except TenantAuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -120,19 +161,27 @@ def health() -> HealthResponse:
     except ValueError:
         salt_ok = False
 
+    try:
+        get_tenant_token_pepper()
+        pepper_ok = True
+    except ValueError:
+        pepper_ok = False
+
+    supabase_ok = bool(os.getenv("SUPABASE_URL")) and bool(os.getenv("SUPABASE_KEY"))
+
     return HealthResponse(
         status="ok",
         salt_configured=salt_ok,
-        supabase_configured=bool(os.getenv("SUPABASE_URL")) and bool(os.getenv("SUPABASE_KEY")),
+        supabase_configured=supabase_ok,
+        tenant_auth_configured=pepper_ok and supabase_ok,
     )
 
 
-@app.post(
-    "/v1/transactions",
-    response_model=SanitizedTransactionResponse,
-    dependencies=[Depends(require_api_token)],
-)
-def create_transaction(payload: SecureTransactionPayload) -> SanitizedTransactionResponse:
+@app.post("/v1/transactions", response_model=SanitizedTransactionResponse)
+def create_transaction(
+    payload: SecureTransactionPayload,
+    tenant: Tenant = Depends(require_tenant),
+) -> SanitizedTransactionResponse:
     try:
         salt = get_system_salt()
     except ValueError:
@@ -147,23 +196,23 @@ def create_transaction(payload: SecureTransactionPayload) -> SanitizedTransactio
     client = _get_supabase_client()
     if client is not None:
         try:
-            client.table("anonymized_transactions").insert(sanitized).execute()
+            client.table("anonymized_transactions").insert({**sanitized, "tenant_id": tenant.id}).execute()
             persisted = True
         except Exception as exc:  # noqa: BLE001 -- persistence is best-effort
             logger.warning("Supabase persistence failed: %s", exc)
 
-    return SanitizedTransactionResponse(**sanitized, persisted=persisted)
+    return SanitizedTransactionResponse(**sanitized, tenant_id=tenant.id, persisted=persisted)
 
 
-@app.post(
-    "/v1/transactions/bulk",
-    response_model=BulkIngestionResponse,
-    dependencies=[Depends(require_api_token)],
-)
-async def create_transactions_bulk(file: UploadFile = File(...)) -> BulkIngestionResponse:
+@app.post("/v1/transactions/bulk", response_model=BulkIngestionResponse)
+async def create_transactions_bulk(
+    file: UploadFile = File(...),
+    tenant: Tenant = Depends(require_tenant),
+) -> BulkIngestionResponse:
     """CSV bulk ingestion: same deterministic validation + masking core as
     /v1/transactions, run row-by-row, with per-row results and best-effort
-    persistence. One bad row never blocks the rest of the file."""
+    persistence. One bad row never blocks the rest of the file. Every
+    persisted row is tagged with the authenticated tenant's id."""
     raw_bytes = await file.read()
     if len(raw_bytes) > MAX_CSV_BODY_BYTES:
         raise HTTPException(status_code=413, detail="CSV file too large.")
@@ -200,6 +249,7 @@ async def create_transactions_bulk(file: UploadFile = File(...)) -> BulkIngestio
                         "masked_contact_phone": row.masked_contact_phone,
                         "masked_contact_email": row.masked_contact_email,
                         "compliance_status": row.compliance_status,
+                        "tenant_id": tenant.id,
                     }).execute()
                     persisted = True
                     persisted_count += 1
@@ -208,10 +258,10 @@ async def create_transactions_bulk(file: UploadFile = File(...)) -> BulkIngestio
         response_rows.append(BulkIngestionRowResponse(**row.model_dump(), persisted=persisted))
 
     return BulkIngestionResponse(
+        tenant_id=tenant.id,
         total_rows=summary.total_rows,
         succeeded=summary.succeeded,
         failed=summary.failed,
         persisted_count=persisted_count,
         results=response_rows,
     )
-

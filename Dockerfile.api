@@ -7,7 +7,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY popia_pipeline.py bi_dispatch.py csv_ingestion.py api.py ./
+COPY popia_pipeline.py bi_dispatch.py csv_ingestion.py tenant_auth.py api.py ./
 
 # Cloud Run injects PORT; default to 8080 for local `docker run`.
 ENV PORT=8080
