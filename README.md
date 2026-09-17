@@ -204,6 +204,17 @@ gcloud config set project "$PROJECT_ID"
 gcloud artifacts repositories create professionalos-repo \
   --repository-format=docker --location="$REGION"
 
+# one-time: secrets live in Secret Manager, not in plaintext env vars
+gcloud services enable secretmanager.googleapis.com
+for secret in popia-salt-key:$POPIA_SALT_KEY supabase-key:$SUPABASE_KEY \
+              tenant-token-pepper:$TENANT_TOKEN_PEPPER openrouter-api-key:$OPENROUTER_API_KEY; do
+  name="${secret%%:*}"; value="${secret#*:}"
+  printf '%s' "$value" | gcloud secrets create "$name" --data-file=-
+  gcloud secrets add-iam-policy-binding "$name" \
+    --member="serviceAccount:$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')-compute@developer.gserviceaccount.com" \
+    --role="roles/secretmanager.secretAccessor"
+done
+
 # --- API service ---
 cp Dockerfile.api Dockerfile
 gcloud builds submit --tag "$REGION-docker.pkg.dev/$PROJECT_ID/professionalos-repo/professionalos-api" .
@@ -212,7 +223,8 @@ gcloud run deploy professionalos-api \
   --region "$REGION" \
   --platform managed \
   --no-allow-unauthenticated \
-  --set-env-vars POPIA_SALT_KEY="$POPIA_SALT_KEY",SUPABASE_URL="$SUPABASE_URL",SUPABASE_KEY="$SUPABASE_KEY",TENANT_TOKEN_PEPPER="$TENANT_TOKEN_PEPPER",OPENROUTER_API_KEY="$OPENROUTER_API_KEY"
+  --set-env-vars SUPABASE_URL="$SUPABASE_URL" \
+  --set-secrets POPIA_SALT_KEY=popia-salt-key:latest,SUPABASE_KEY=supabase-key:latest,TENANT_TOKEN_PEPPER=tenant-token-pepper:latest,OPENROUTER_API_KEY=openrouter-api-key:latest
 
 # --- Streamlit staging UI ---
 cp Dockerfile.streamlit Dockerfile
@@ -222,7 +234,8 @@ gcloud run deploy professionalos-ui \
   --region "$REGION" \
   --platform managed \
   --allow-unauthenticated \
-  --set-env-vars POPIA_SALT_KEY="$POPIA_SALT_KEY",SUPABASE_URL="$SUPABASE_URL",SUPABASE_KEY="$SUPABASE_KEY",TENANT_TOKEN_PEPPER="$TENANT_TOKEN_PEPPER",OPENROUTER_API_KEY="$OPENROUTER_API_KEY"
+  --set-env-vars SUPABASE_URL="$SUPABASE_URL" \
+  --set-secrets POPIA_SALT_KEY=popia-salt-key:latest,SUPABASE_KEY=supabase-key:latest,TENANT_TOKEN_PEPPER=tenant-token-pepper:latest
 ```
 
 Live deployment (professionalos-508906, africa-south1):
@@ -237,9 +250,9 @@ Notes:
   access, switch to `--allow-unauthenticated` and rely on tenant tokens
   alone, or front it with API Gateway / a Cloud Run service-to-service
   invoker instead.
-- `--set-env-vars` puts secrets in the revision config in plaintext (visible
-  to anyone with read access to the service). For anything beyond a demo,
-  use Secret Manager instead: `gcloud secrets create popia-salt-key
-  --data-file=-`, then `--set-secrets POPIA_SALT_KEY=popia-salt-key:latest`
-  in place of `--set-env-vars`.
+- Secrets (`POPIA_SALT_KEY`, `SUPABASE_KEY`, `TENANT_TOKEN_PEPPER`,
+  `OPENROUTER_API_KEY`) are stored in GCP Secret Manager and mounted via
+  `--set-secrets`, not passed as plaintext env vars -- the revision config
+  and `gcloud run services describe` output never show their values.
+  `SUPABASE_URL` stays a plain env var since it isn't sensitive.
 - Cloud Run injects `$PORT` automatically; both Dockerfiles already read it.
