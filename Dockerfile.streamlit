@@ -1,0 +1,22 @@
+# ProfessionalOS Streamlit UI -- staging/demo image for Cloud Run.
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY popia_pipeline.py bi_dispatch.py app.py ./
+COPY .streamlit/ .streamlit/
+
+ENV PORT=8080
+EXPOSE 8080
+
+RUN useradd --create-home --shell /usr/sbin/nologin appuser
+USER appuser
+
+CMD exec streamlit run app.py \
+    --server.port=${PORT} \
+    --server.address=0.0.0.0 \
+    --server.headless=true \
+    --browser.gatherUsageStats=false

@@ -128,4 +128,55 @@ tests/test_api.py
 supabase/schema.sql            Table DDL + RLS policy for anonymized_transactions
 .github/workflows/test.yml     CI: runs pytest on push/PR to main
 .streamlit/config.toml         App theme
+Dockerfile.api                 Cloud Run image: FastAPI webhook
+Dockerfile.streamlit           Cloud Run image: Streamlit UI
 ```
+
+## Deploy to Cloud Run
+
+Two separate services -- deploy either or both, independently:
+
+- `Dockerfile.api` -- the production webhook (`api.py`)
+- `Dockerfile.streamlit` -- the staging/demo UI (`app.py`)
+
+Easiest path if `gcloud`/`docker` aren't installed locally: open
+[Cloud Shell](https://console.cloud.google.com) (has both preinstalled and
+already authenticated) and clone this repo there.
+
+```bash
+export PROJECT_ID=<your-gcp-project-id>
+export REGION=africa-south1   # or your preferred region
+gcloud config set project "$PROJECT_ID"
+
+# --- API service ---
+gcloud builds submit --tag "gcr.io/$PROJECT_ID/professionalos-api" -f Dockerfile.api .
+gcloud run deploy professionalos-api \
+  --image "gcr.io/$PROJECT_ID/professionalos-api" \
+  --region "$REGION" \
+  --platform managed \
+  --no-allow-unauthenticated \
+  --set-env-vars POPIA_SALT_KEY="$POPIA_SALT_KEY",SUPABASE_URL="$SUPABASE_URL",SUPABASE_KEY="$SUPABASE_KEY",API_WEBHOOK_TOKEN="$API_WEBHOOK_TOKEN"
+
+# --- Streamlit staging UI ---
+gcloud builds submit --tag "gcr.io/$PROJECT_ID/professionalos-ui" -f Dockerfile.streamlit .
+gcloud run deploy professionalos-ui \
+  --image "gcr.io/$PROJECT_ID/professionalos-ui" \
+  --region "$REGION" \
+  --platform managed \
+  --allow-unauthenticated \
+  --set-env-vars POPIA_SALT_KEY="$POPIA_SALT_KEY",SUPABASE_URL="$SUPABASE_URL",SUPABASE_KEY="$SUPABASE_KEY",OPENROUTER_API_KEY="$OPENROUTER_API_KEY"
+```
+
+Notes:
+
+- The API service is deployed `--no-allow-unauthenticated` by default (Cloud
+  Run IAM, on top of the app's own bearer-token check -- belt and braces).
+  If POS/e-commerce callers need unauthenticated network access, switch to
+  `--allow-unauthenticated` and rely on `API_WEBHOOK_TOKEN` alone, or front
+  it with API Gateway / a Cloud Run service-to-service invoker instead.
+- `--set-env-vars` puts secrets in the revision config in plaintext (visible
+  to anyone with read access to the service). For anything beyond a demo,
+  use Secret Manager instead: `gcloud secrets create popia-salt-key
+  --data-file=-`, then `--set-secrets POPIA_SALT_KEY=popia-salt-key:latest`
+  in place of `--set-env-vars`.
+- Cloud Run injects `$PORT` automatically; both Dockerfiles already read it.

@@ -1,0 +1,13 @@
+.git
+.github
+.gitignore
+.env
+.env.*
+__pycache__/
+*/__pycache__/
+*.pyc
+.pytest_cache/
+.streamlit/secrets.toml
+tests/
+README.md
+_to_delete/

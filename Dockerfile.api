@@ -1,0 +1,19 @@
+# ProfessionalOS REST API (FastAPI webhook) -- production image for Cloud Run.
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install deps first so this layer caches across code-only changes.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY popia_pipeline.py bi_dispatch.py api.py ./
+
+# Cloud Run injects PORT; default to 8080 for local `docker run`.
+ENV PORT=8080
+EXPOSE 8080
+
+RUN useradd --create-home --shell /usr/sbin/nologin appuser
+USER appuser
+
+CMD exec uvicorn api:app --host 0.0.0.0 --port ${PORT}
