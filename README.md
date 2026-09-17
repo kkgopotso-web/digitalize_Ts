@@ -19,8 +19,12 @@ Orynexa Technologies' ProfessionalOS / BusinessOS platform
 4. **Production webhook (REST API)** — `POST /v1/transactions` exposes the
    exact same masking core over HTTP, bearer-token authenticated, for
    external POS/e-commerce frontends to submit raw payloads directly
-   (`api.py`). The Streamlit app (`app.py`) is the human-facing surface
-   over the same pipeline; the API is the machine-facing one.
+   (`api.py`). `POST /v1/transactions/bulk` does the same over a CSV file
+   for batch imports — every row validated and masked independently
+   (`csv_ingestion.py`), so one bad row never blocks the rest of the file.
+   The Streamlit app (`app.py`) exposes both the single-transaction form
+   and a CSV upload panel over the same pipeline; the API is the
+   machine-facing surface.
 
 ## Design principles (per project rules)
 
@@ -109,6 +113,17 @@ curl -X POST http://localhost:8000/v1/transactions \
 `GET /health` needs no auth and reports whether the salt/Supabase are
 configured, for load-balancer/Cloud Run health checks.
 
+Bulk CSV import (`POST /v1/transactions/bulk`, same bearer auth): file must
+be UTF-8, ≤1MB, ≤500 rows, with columns `merchant_id, gross_value_cents,
+raw_phone_number, raw_email`. Returns per-row status -- one bad row fails
+independently and never blocks the rest of the file.
+
+```bash
+curl -X POST http://localhost:8000/v1/transactions/bulk \
+  -H "Authorization: Bearer $API_WEBHOOK_TOKEN" \
+  -F "file=@transactions.csv"
+```
+
 ## Test
 
 ```bash
@@ -118,11 +133,13 @@ pytest -v
 ## Project structure
 
 ```
-app.py                       Streamlit UI
-api.py                        FastAPI webhook (POST /v1/transactions, GET /health)
+app.py                       Streamlit UI (single form + bulk CSV upload)
+api.py                        FastAPI webhook (POST /v1/transactions, /v1/transactions/bulk, GET /health)
 popia_pipeline.py             Validation + POPIA masking (deterministic core)
+csv_ingestion.py               CSV parsing + per-row masking (deterministic, no I/O)
 bi_dispatch.py                 Metric aggregation + safe multi-model AI dispatch
 tests/test_popia_pipeline.py
+tests/test_csv_ingestion.py
 tests/test_bi_dispatch.py
 tests/test_api.py
 supabase/schema.sql            Table DDL + RLS policy for anonymized_transactions
@@ -143,29 +160,44 @@ Easiest path if `gcloud`/`docker` aren't installed locally: open
 [Cloud Shell](https://console.cloud.google.com) (has both preinstalled and
 already authenticated) and clone this repo there.
 
+`gcr.io` is deprecated for new GCP projects -- use Artifact Registry
+instead. The Dockerfile builds a fresh copy of the source each time, so
+`gcloud builds submit` must be pointed at a Dockerfile that's actually
+named `Dockerfile` (copy the one you want first).
+
 ```bash
 export PROJECT_ID=<your-gcp-project-id>
 export REGION=africa-south1   # or your preferred region
 gcloud config set project "$PROJECT_ID"
 
+# one-time: Artifact Registry repo for both images
+gcloud artifacts repositories create professionalos-repo \
+  --repository-format=docker --location="$REGION"
+
 # --- API service ---
-gcloud builds submit --tag "gcr.io/$PROJECT_ID/professionalos-api" -f Dockerfile.api .
+cp Dockerfile.api Dockerfile
+gcloud builds submit --tag "$REGION-docker.pkg.dev/$PROJECT_ID/professionalos-repo/professionalos-api" .
 gcloud run deploy professionalos-api \
-  --image "gcr.io/$PROJECT_ID/professionalos-api" \
+  --image "$REGION-docker.pkg.dev/$PROJECT_ID/professionalos-repo/professionalos-api" \
   --region "$REGION" \
   --platform managed \
   --no-allow-unauthenticated \
-  --set-env-vars POPIA_SALT_KEY="$POPIA_SALT_KEY",SUPABASE_URL="$SUPABASE_URL",SUPABASE_KEY="$SUPABASE_KEY",API_WEBHOOK_TOKEN="$API_WEBHOOK_TOKEN"
+  --set-env-vars POPIA_SALT_KEY="$POPIA_SALT_KEY",SUPABASE_URL="$SUPABASE_URL",SUPABASE_KEY="$SUPABASE_KEY",API_WEBHOOK_TOKEN="$API_WEBHOOK_TOKEN",OPENROUTER_API_KEY="$OPENROUTER_API_KEY"
 
 # --- Streamlit staging UI ---
-gcloud builds submit --tag "gcr.io/$PROJECT_ID/professionalos-ui" -f Dockerfile.streamlit .
+cp Dockerfile.streamlit Dockerfile
+gcloud builds submit --tag "$REGION-docker.pkg.dev/$PROJECT_ID/professionalos-repo/professionalos-ui" .
 gcloud run deploy professionalos-ui \
-  --image "gcr.io/$PROJECT_ID/professionalos-ui" \
+  --image "$REGION-docker.pkg.dev/$PROJECT_ID/professionalos-repo/professionalos-ui" \
   --region "$REGION" \
   --platform managed \
   --allow-unauthenticated \
   --set-env-vars POPIA_SALT_KEY="$POPIA_SALT_KEY",SUPABASE_URL="$SUPABASE_URL",SUPABASE_KEY="$SUPABASE_KEY",OPENROUTER_API_KEY="$OPENROUTER_API_KEY"
 ```
+
+Live deployment (professionalos-508906, africa-south1):
+- API: https://professionalos-api-22738190210.africa-south1.run.app
+- UI: https://professionalos-ui-22738190210.africa-south1.run.app
 
 Notes:
 

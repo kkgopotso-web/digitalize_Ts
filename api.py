@@ -19,13 +19,14 @@ import os
 import logging
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from supabase import create_client
 
 from popia_pipeline import SecureTransactionPayload, process_and_mask_transaction, get_system_salt
+from csv_ingestion import CsvFormatError, ingest_transactions_csv
 
 load_dotenv()
 
@@ -34,6 +35,10 @@ logger = logging.getLogger("ProfessionalOS.API")
 # A valid request is four short fields; this is a generous ceiling that
 # still blocks oversized/abusive request bodies.
 MAX_BODY_BYTES = 4096
+
+# CSV bulk uploads are legitimately larger than a single JSON payload --
+# generous enough for MAX_CSV_ROWS short rows, still a hard ceiling.
+MAX_CSV_BODY_BYTES = 1_000_000
 
 app = FastAPI(
     title="ProfessionalOS Secure Transaction Gateway API",
@@ -49,6 +54,26 @@ class SanitizedTransactionResponse(BaseModel):
     masked_contact_email: str
     compliance_status: str
     persisted: bool
+
+
+class BulkIngestionRowResponse(BaseModel):
+    row_number: int
+    status: str
+    merchant_hash: Optional[str] = None
+    transaction_value_zar: Optional[float] = None
+    masked_contact_phone: Optional[str] = None
+    masked_contact_email: Optional[str] = None
+    compliance_status: Optional[str] = None
+    error: Optional[str] = None
+    persisted: Optional[bool] = None
+
+
+class BulkIngestionResponse(BaseModel):
+    total_rows: int
+    succeeded: int
+    failed: int
+    persisted_count: int
+    results: list[BulkIngestionRowResponse]
 
 
 class HealthResponse(BaseModel):
@@ -68,8 +93,10 @@ def _get_supabase_client():
 @app.middleware("http")
 async def enforce_max_body_size(request: Request, call_next):
     content_length = request.headers.get("content-length")
-    if content_length is not None and int(content_length) > MAX_BODY_BYTES:
-        return JSONResponse(status_code=413, content={"detail": "Payload too large."})
+    if content_length is not None:
+        limit = MAX_CSV_BODY_BYTES if request.url.path == "/v1/transactions/bulk" else MAX_BODY_BYTES
+        if int(content_length) > limit:
+            return JSONResponse(status_code=413, content={"detail": "Payload too large."})
     return await call_next(request)
 
 
@@ -126,3 +153,65 @@ def create_transaction(payload: SecureTransactionPayload) -> SanitizedTransactio
             logger.warning("Supabase persistence failed: %s", exc)
 
     return SanitizedTransactionResponse(**sanitized, persisted=persisted)
+
+
+@app.post(
+    "/v1/transactions/bulk",
+    response_model=BulkIngestionResponse,
+    dependencies=[Depends(require_api_token)],
+)
+async def create_transactions_bulk(file: UploadFile = File(...)) -> BulkIngestionResponse:
+    """CSV bulk ingestion: same deterministic validation + masking core as
+    /v1/transactions, run row-by-row, with per-row results and best-effort
+    persistence. One bad row never blocks the rest of the file."""
+    raw_bytes = await file.read()
+    if len(raw_bytes) > MAX_CSV_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="CSV file too large.")
+
+    try:
+        csv_text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="CSV file must be UTF-8 encoded.")
+
+    try:
+        salt = get_system_salt()
+    except ValueError:
+        logger.error("Rejected bulk request: POPIA_SALT_KEY missing or insecure.")
+        raise HTTPException(status_code=500, detail="Server misconfiguration: compliance salt unavailable.")
+
+    try:
+        summary = ingest_transactions_csv(csv_text, salt)
+    except CsvFormatError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    client = _get_supabase_client()
+    persisted_count = 0
+    response_rows: list[BulkIngestionRowResponse] = []
+
+    for row in summary.results:
+        persisted: Optional[bool] = None
+        if row.status == "success":
+            persisted = False
+            if client is not None:
+                try:
+                    client.table("anonymized_transactions").insert({
+                        "merchant_hash": row.merchant_hash,
+                        "transaction_value_zar": row.transaction_value_zar,
+                        "masked_contact_phone": row.masked_contact_phone,
+                        "masked_contact_email": row.masked_contact_email,
+                        "compliance_status": row.compliance_status,
+                    }).execute()
+                    persisted = True
+                    persisted_count += 1
+                except Exception as exc:  # noqa: BLE001 -- persistence is best-effort
+                    logger.warning("Supabase persistence failed for row %s: %s", row.row_number, exc)
+        response_rows.append(BulkIngestionRowResponse(**row.model_dump(), persisted=persisted))
+
+    return BulkIngestionResponse(
+        total_rows=summary.total_rows,
+        succeeded=summary.succeeded,
+        failed=summary.failed,
+        persisted_count=persisted_count,
+        results=response_rows,
+    )
+

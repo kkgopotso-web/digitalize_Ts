@@ -120,3 +120,143 @@ def test_transactions_rejects_oversized_body():
     oversized_payload = {**VALID_PAYLOAD, "raw_email": "a" * (MAX_BODY_BYTES + 500) + "@townshipbiz.co.za"}
     resp = client.post("/v1/transactions", json=oversized_payload, headers=auth_headers())
     assert resp.status_code == 413
+
+
+# ---------- bulk CSV ingestion ----------
+
+BULK_HEADER = "merchant_id,gross_value_cents,raw_phone_number,raw_email"
+BULK_VALID_ROW_1 = "M_SOWETO_TRADER_1092,125050,27721234567,trader@townshipbiz.co.za"
+BULK_VALID_ROW_2 = "M_ALEX_SPAZA_SHOP_02,50000,27831234567,spaza@alexbiz.co.za"
+BULK_BAD_ROW = "M_BAD,not-a-number,27721234567,trader@townshipbiz.co.za"
+
+
+def _csv_file(*rows, filename="transactions.csv"):
+    content = "\n".join([BULK_HEADER, *rows])
+    return {"file": (filename, content, "text/csv")}
+
+
+def test_bulk_rejects_missing_auth_header():
+    resp = client.post("/v1/transactions/bulk", files=_csv_file(BULK_VALID_ROW_1))
+    assert resp.status_code == 401
+
+
+def test_bulk_fails_closed_when_token_not_configured(monkeypatch):
+    monkeypatch.delenv("API_WEBHOOK_TOKEN", raising=False)
+    resp = client.post("/v1/transactions/bulk", files=_csv_file(BULK_VALID_ROW_1), headers=auth_headers())
+    assert resp.status_code == 503
+
+
+def test_bulk_processes_all_valid_rows():
+    resp = client.post(
+        "/v1/transactions/bulk",
+        files=_csv_file(BULK_VALID_ROW_1, BULK_VALID_ROW_2),
+        headers=auth_headers(),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total_rows"] == 2
+    assert body["succeeded"] == 2
+    assert body["failed"] == 0
+    assert body["persisted_count"] == 0  # no Supabase configured
+    assert all(r["status"] == "success" for r in body["results"])
+    assert all(r["persisted"] is False for r in body["results"])
+
+
+def test_bulk_isolates_bad_rows_from_good_rows():
+    resp = client.post(
+        "/v1/transactions/bulk",
+        files=_csv_file(BULK_VALID_ROW_1, BULK_BAD_ROW, BULK_VALID_ROW_2),
+        headers=auth_headers(),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total_rows"] == 3
+    assert body["succeeded"] == 2
+    assert body["failed"] == 1
+    assert body["results"][1]["status"] == "error"
+    assert body["results"][1]["row_number"] == 2
+
+
+def test_bulk_never_echoes_raw_input():
+    resp = client.post(
+        "/v1/transactions/bulk",
+        files=_csv_file(BULK_VALID_ROW_1),
+        headers=auth_headers(),
+    )
+    serialized = resp.text
+    assert "27721234567" not in serialized
+    assert "trader@townshipbiz.co.za" not in serialized
+    assert "M_SOWETO_TRADER_1092" not in serialized
+
+
+def test_bulk_rejects_structurally_invalid_csv():
+    resp = client.post(
+        "/v1/transactions/bulk",
+        files={"file": ("bad.csv", "not,the,right,columns\n1,2,3,4", "text/csv")},
+        headers=auth_headers(),
+    )
+    assert resp.status_code == 400
+
+
+def test_bulk_rejects_empty_csv():
+    resp = client.post(
+        "/v1/transactions/bulk",
+        files={"file": ("empty.csv", "", "text/csv")},
+        headers=auth_headers(),
+    )
+    assert resp.status_code == 400
+
+
+def test_bulk_returns_500_when_salt_missing(monkeypatch):
+    monkeypatch.delenv("POPIA_SALT_KEY", raising=False)
+    resp = client.post(
+        "/v1/transactions/bulk",
+        files=_csv_file(BULK_VALID_ROW_1),
+        headers=auth_headers(),
+    )
+    assert resp.status_code == 500
+
+
+def test_bulk_rejects_oversized_file():
+    from api import MAX_CSV_BODY_BYTES
+    huge_row = f"M_X,100,27721234567,{'a' * (MAX_CSV_BODY_BYTES + 1000)}@x.co.za"
+    resp = client.post(
+        "/v1/transactions/bulk",
+        files=_csv_file(huge_row),
+        headers=auth_headers(),
+    )
+    assert resp.status_code == 413
+
+
+def test_bulk_persists_successful_rows_when_supabase_configured(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_KEY", "fake-key")
+
+    inserted = []
+
+    class _FakeTable:
+        def insert(self, data):
+            inserted.append(data)
+            return self
+
+        def execute(self):
+            return None
+
+    class _FakeClient:
+        def table(self, name):
+            assert name == "anonymized_transactions"
+            return _FakeTable()
+
+    import api as api_module
+    monkeypatch.setattr(api_module, "_get_supabase_client", lambda: _FakeClient())
+
+    resp = client.post(
+        "/v1/transactions/bulk",
+        files=_csv_file(BULK_VALID_ROW_1, BULK_VALID_ROW_2),
+        headers=auth_headers(),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["persisted_count"] == 2
+    assert all(r["persisted"] is True for r in body["results"])
+    assert len(inserted) == 2

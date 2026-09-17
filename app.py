@@ -8,6 +8,7 @@ from supabase import create_client
 
 from popia_pipeline import process_and_mask_transaction, get_system_salt
 from bi_dispatch import compute_merchant_metrics, dispatch_bi_summary
+from csv_ingestion import ingest_transactions_csv, CsvFormatError
 
 load_dotenv()
 
@@ -27,6 +28,8 @@ if "history" not in st.session_state:
     st.session_state.history = []
 if "ai_summaries" not in st.session_state:
     st.session_state.ai_summaries = {}
+if "bulk_summary" not in st.session_state:
+    st.session_state.bulk_summary = None
 
 # ---------- Sidebar: system status ----------
 with st.sidebar:
@@ -147,6 +150,69 @@ if st.session_state.history:
     )
 else:
     st.caption("No transactions processed yet this session.")
+
+# ---------- Bulk CSV upload ----------
+st.divider()
+st.subheader("Bulk CSV upload")
+st.caption(
+    "Columns required: merchant_id, gross_value_cents, raw_phone_number, raw_email. "
+    "Each row is validated and anonymised independently under POPIA — one bad row "
+    "never blocks the rest of the file."
+)
+
+uploaded_file = st.file_uploader("Choose a CSV file", type=["csv"], key="bulk_csv_uploader")
+
+if uploaded_file is not None and st.button("Process CSV", type="primary"):
+    try:
+        salt = get_system_salt()
+        csv_text = uploaded_file.getvalue().decode("utf-8")
+
+        with st.spinner("Validating and anonymising rows..."):
+            summary = ingest_transactions_csv(csv_text, salt)
+
+            persisted_count = 0
+            for row in summary.results:
+                if row.status != "success":
+                    continue
+                sanitized = row.model_dump(exclude={"row_number", "status", "error"})
+                if supabase:
+                    try:
+                        supabase.table("anonymized_transactions").insert(sanitized).execute()
+                        sanitized["_persisted"] = True
+                        persisted_count += 1
+                    except Exception:
+                        sanitized["_persisted"] = False
+                else:
+                    sanitized["_persisted"] = False
+                sanitized["_processed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                st.session_state.history.insert(0, sanitized)
+
+        st.session_state.bulk_summary = summary
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Rows processed", summary.total_rows)
+        c2.metric("Succeeded", summary.succeeded)
+        c3.metric("Failed", summary.failed)
+        if supabase and summary.succeeded:
+            st.caption(f"{persisted_count} of {summary.succeeded} succeeded rows persisted to Supabase.")
+        elif not supabase:
+            st.warning("Supabase credentials missing — persistence step bypassed.")
+
+    except ValueError as e:
+        st.error(f"Configuration error: {e}")
+    except CsvFormatError as e:
+        st.error(f"CSV format error: {e}")
+
+if st.session_state.bulk_summary is not None:
+    results_df = pd.DataFrame([r.model_dump() for r in st.session_state.bulk_summary.results])
+    st.dataframe(results_df, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download results (CSV)",
+        results_df.to_csv(index=False).encode("utf-8"),
+        file_name="bulk_ingestion_results.csv",
+        mime="text/csv",
+        key="bulk_results_download",
+    )
 
 # ---------- AI Business Insights (Safe AI Intelligence Dispatch) ----------
 st.divider()

@@ -6,7 +6,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY popia_pipeline.py bi_dispatch.py app.py ./
+COPY popia_pipeline.py bi_dispatch.py csv_ingestion.py app.py ./
 COPY .streamlit/ .streamlit/
 
 ENV PORT=8080
