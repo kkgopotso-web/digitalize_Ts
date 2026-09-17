@@ -7,12 +7,15 @@ from dotenv import load_dotenv
 from supabase import create_client
 
 from popia_pipeline import process_and_mask_transaction, get_system_salt
+from bi_dispatch import compute_merchant_metrics, dispatch_bi_summary
 
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
 st.set_page_config(
     page_title="ProfessionalOS | Secure Transaction Gateway",
@@ -22,6 +25,8 @@ st.set_page_config(
 
 if "history" not in st.session_state:
     st.session_state.history = []
+if "ai_summaries" not in st.session_state:
+    st.session_state.ai_summaries = {}
 
 # ---------- Sidebar: system status ----------
 with st.sidebar:
@@ -39,6 +44,11 @@ with st.sidebar:
     else:
         st.warning("Supabase: not configured")
 
+    if OPENROUTER_API_KEY:
+        st.success("AI dispatch (OpenRouter): configured")
+    else:
+        st.warning("AI dispatch (OpenRouter): not configured")
+
     st.divider()
     st.markdown("**Session summary**")
     st.metric("Transactions processed", len(st.session_state.history))
@@ -49,6 +59,7 @@ with st.sidebar:
         st.divider()
         if st.button("Clear session history", use_container_width=True):
             st.session_state.history = []
+            st.session_state.ai_summaries = {}
             st.rerun()
 
 # ---------- Header ----------
@@ -136,3 +147,38 @@ if st.session_state.history:
     )
 else:
     st.caption("No transactions processed yet this session.")
+
+# ---------- AI Business Insights (Safe AI Intelligence Dispatch) ----------
+st.divider()
+st.subheader("AI business insights")
+st.caption(
+    "Deterministic Python aggregates the masked metrics below; the LLM only writes "
+    "the narrative summary over those numbers, never touches raw data, and never "
+    "computes anything financial itself."
+)
+
+merchant_hashes = sorted({item["merchant_hash"] for item in st.session_state.history})
+
+if not merchant_hashes:
+    st.info("Process at least one transaction to generate an AI summary for a merchant.")
+elif not OPENROUTER_API_KEY:
+    st.warning("OPENROUTER_API_KEY is not configured — AI dispatch is unavailable.")
+else:
+    selected_hash = st.selectbox("Merchant (by hash)", merchant_hashes)
+    records = [item for item in st.session_state.history if item["merchant_hash"] == selected_hash]
+
+    if st.button("Generate AI summary", type="secondary"):
+        try:
+            with st.spinner("Computing metrics and dispatching to AI pipeline..."):
+                metrics = compute_merchant_metrics(records)
+                result = dispatch_bi_summary(metrics, api_key=OPENROUTER_API_KEY)
+            st.session_state.ai_summaries[selected_hash] = result
+        except Exception as e:
+            st.error(f"AI dispatch failed: {e}")
+
+    cached = st.session_state.ai_summaries.get(selected_hash)
+    if cached:
+        st.success(f"Model: {cached['model_used']}")
+        st.write(cached["summary"])
+        with st.expander("Metrics sent to the model"):
+            st.json(cached["metrics"])
