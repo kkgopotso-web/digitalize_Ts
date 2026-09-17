@@ -148,7 +148,7 @@ def test_transactions_persists_with_tenant_id_when_supabase_configured(monkeypat
     inserted = []
 
     class _FakeTable:
-        def insert(self, data):
+        def insert(self, data, returning="representation"):
             inserted.append(data)
             return self
 
@@ -321,7 +321,7 @@ def test_bulk_persists_successful_rows_with_tenant_id(monkeypatch):
     inserted = []
 
     class _FakeTable:
-        def insert(self, data):
+        def insert(self, data, returning="representation"):
             inserted.append(data)
             return self
 

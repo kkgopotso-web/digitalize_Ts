@@ -196,7 +196,7 @@ def create_transaction(
     client = _get_supabase_client()
     if client is not None:
         try:
-            client.table("anonymized_transactions").insert({**sanitized, "tenant_id": tenant.id}).execute()
+            client.table("anonymized_transactions").insert({**sanitized, "tenant_id": tenant.id}, returning="minimal").execute()
             persisted = True
         except Exception as exc:  # noqa: BLE001 -- persistence is best-effort
             logger.warning("Supabase persistence failed: %s", exc)
@@ -250,7 +250,7 @@ async def create_transactions_bulk(
                         "masked_contact_email": row.masked_contact_email,
                         "compliance_status": row.compliance_status,
                         "tenant_id": tenant.id,
-                    }).execute()
+                    }, returning="minimal").execute()
                     persisted = True
                     persisted_count += 1
                 except Exception as exc:  # noqa: BLE001 -- persistence is best-effort

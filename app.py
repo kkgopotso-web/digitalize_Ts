@@ -150,7 +150,7 @@ with form_col:
                 sanitized["tenant_id"] = tenant.id
 
                 if supabase:
-                    supabase.table("anonymized_transactions").insert(sanitized).execute()
+                    supabase.table("anonymized_transactions").insert(sanitized, returning="minimal").execute()
                     sanitized["_persisted"] = True
                 else:
                     sanitized["_persisted"] = False
@@ -231,7 +231,7 @@ if uploaded_file is not None and st.button("Process CSV", type="primary"):
                 sanitized["tenant_id"] = tenant.id
                 if supabase:
                     try:
-                        supabase.table("anonymized_transactions").insert(sanitized).execute()
+                        supabase.table("anonymized_transactions").insert(sanitized, returning="minimal").execute()
                         sanitized["_persisted"] = True
                         persisted_count += 1
                     except Exception:
