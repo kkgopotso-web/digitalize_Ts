@@ -79,23 +79,27 @@ with st.sidebar:
         st.session_state.tenant = None
         st.info("Enter Orynexa tenant token to process transactions.")
 
-    st.divider()
+    is_admin = st.query_params.get("admin") == "1"
 
-    try:
-        get_system_salt()
-        st.success("POPIA salt key: configured")
-    except ValueError:
-        st.error("POPIA salt key: missing / insecure")
+    if is_admin:
+        st.divider()
+        st.caption("Admin view (?admin=1) — not shown to clients")
 
-    if supabase:
-        st.success("Orynexa System: connected")
-    else:
-        st.warning("Orynexa System: not configured")
+        try:
+            get_system_salt()
+            st.success("POPIA salt key: configured")
+        except ValueError:
+            st.error("POPIA salt key: missing / insecure")
 
-    if OPENROUTER_API_KEY:
-        st.success("AI dispatch (OpenRouter): configured")
-    else:
-        st.warning("AI dispatch (OpenRouter): not configured")
+        if supabase:
+            st.success("Orynexa System: connected")
+        else:
+            st.warning("Orynexa System: not configured")
+
+        if OPENROUTER_API_KEY:
+            st.success("AI dispatch (OpenRouter): configured")
+        else:
+            st.warning("AI dispatch (OpenRouter): not configured")
 
     st.divider()
     st.markdown("**Session summary**")
