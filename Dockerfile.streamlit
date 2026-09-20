@@ -8,6 +8,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY popia_pipeline.py bi_dispatch.py csv_ingestion.py tenant_auth.py app.py ./
 COPY .streamlit/ .streamlit/
+COPY assets/ assets/
 
 ENV PORT=8080
 EXPOSE 8080
