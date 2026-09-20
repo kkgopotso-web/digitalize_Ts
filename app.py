@@ -61,7 +61,7 @@ with st.sidebar:
 
     st.markdown("**Tenant**")
     tenant_token_input = st.text_input(
-        "Tenant API token", type="password", key="tenant_token_input",
+        "Orynexa Token Key", type="password", key="tenant_token_input",
         help="Issued when your business was onboarded (scripts/create_tenant.py).",
     )
     if tenant_token_input:
