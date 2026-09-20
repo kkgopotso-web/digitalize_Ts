@@ -76,7 +76,7 @@ with st.sidebar:
             st.error("Tenant auth not configured (TENANT_TOKEN_PEPPER missing).")
     else:
         st.session_state.tenant = None
-        st.info("Enter a tenant token to process transactions.")
+        st.info("Enter Orynexa tenant token to process transactions.")
 
     st.divider()
 
