@@ -87,9 +87,9 @@ with st.sidebar:
         st.error("POPIA salt key: missing / insecure")
 
     if supabase:
-        st.success("Supabase: connected")
+        st.success("Orynexa System: connected")
     else:
-        st.warning("Supabase: not configured")
+        st.warning("Orynexa System: not configured")
 
     if OPENROUTER_API_KEY:
         st.success("AI dispatch (OpenRouter): configured")
