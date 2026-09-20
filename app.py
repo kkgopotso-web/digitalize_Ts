@@ -56,6 +56,7 @@ if "tenant" not in st.session_state:
 
 # ---------- Sidebar: system status ----------
 with st.sidebar:
+    st.image("assets/orynexa_logo.jpg", width=120)
     st.markdown("### Orynexa Technologies")
     st.caption("ProfessionalOS — POC 1")
 
